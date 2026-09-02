@@ -140,7 +140,24 @@ nohup uv run python -u process_h5ad.py \
 
   # Batch extract all datasets (automatically skips completed files)
   python extract_ntc_h5ad.py
-
+  
   # Force overwrite existing NTC files
   python extract_ntc_h5ad.py --overwrite
   ```
+
+---
+
+### 7) `update_target_gene_symbols.py`
+- **Purpose**: Directly updates target gene anomalies (Ensembl IDs or pseudogene aliases) in standardized h5ad files and metadata JSON files to official GENCODE v32 gene symbols:
+  - `ENSG00000170846` $\rightarrow$ `AC093323.1` (GENCODE v32 official symbol)
+  - `ENSG00000230707` $\rightarrow$ `AL589987.1` (GENCODE v32 official symbol)
+  - `AHSA2` $\rightarrow$ `AHSA2P` (GENCODE v32 pseudogene symbol)
+- **Usage**:
+  ```bash
+  # Preview target gene updates (dry-run)
+  python update_target_gene_symbols.py --dry-run
+
+  # Apply updates in-place to standardized h5ad files and metadata JSON
+  python update_target_gene_symbols.py
+  ```
+

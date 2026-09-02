@@ -93,6 +93,13 @@ COMMON_NT_LABELS = {
 
 STANDARD_NT = "non-targeting"
 
+# Specific target gene symbol overrides to official GENCODE v32 symbols
+TARGET_GENE_OVERRIDE = {
+    "ENSG00000170846": "AC093323.1",
+    "ENSG00000230707": "AL589987.1",
+    "AHSA2":           "AHSA2P",
+}
+
 
 # ============================================================
 # 1. Load GENCODE v32
@@ -146,6 +153,12 @@ def apply_conversion(val: str, ds_name: str, conv: dict,
     base = v.rsplit("_", 1)[0] if "_" in v and v.rsplit("_", 1)[1].isdigit() else v
     if base.lower() in nt_labels:
         return STANDARD_NT
+
+    # Direct target gene override (e.g. Ensembl ID to v32 symbol, pseudogene alias)
+    if v in TARGET_GENE_OVERRIDE:
+        return TARGET_GENE_OVERRIDE[v]
+    if base in TARGET_GENE_OVERRIDE:
+        return TARGET_GENE_OVERRIDE[base]
 
     # Apply gene_conversion
     if base in conv:
