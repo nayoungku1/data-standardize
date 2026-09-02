@@ -1,27 +1,28 @@
 """
 restore_raw_counts.py
 ---------------------
-standardized 디렉토리의 데이터셋 중 raw count가 아닌 arc_h1과 kolf_strong의 X를
-raw count로 복원/교체하는 스크립트.
+Restores or replaces expression matrix X with raw UMI counts for datasets in the
+standardized directory that were previously stored as normalized/transformed values (arc_h1 and kolf_strong).
 
 1. kolf_strong:
-   - 원본/standardized 파일의 layers['counts']에 정수 raw count(CSR)가 존재함
-   - X를 layers['counts']로 교체하고, 기존 normalized X는 layers['normalized']로 보존
+   - Contains raw integer counts (CSR) in layers['counts']
+   - Replaces X with layers['counts'] while preserving original normalized X in layers['normalized']
 
 2. arc_h1:
-   - X가 log1p(raw_count)로 저장되어 있음 (expm1(data)를 취하면 정확한 정수 UMI count 복원)
-   - CSR의 sparsity 구조(0의 expm1은 0)는 그대로 유지되므로, data 배열을 expm1 후 반올림
-   - 기존 log1p X는 layers['log1p']로 백업 보존
+   - X is stored as ln(1 + raw_count) (log1p)
+   - expm1(data) restores exact integer UMI counts (floating-point precision within 1e-6)
+   - Preserves CSR sparsity structure (expm1(0) == 0) and rounds expm1(data) to integer
+   - Backs up original log1p matrix to layers['log1p']
 
 Usage:
-    # 1. 시뮬레이션 및 데이터 샘플 미리보기
+    # 1. Preview data samples and precision without modification
     python restore_raw_counts.py --dry-run
 
-    # 2. 특정 데이터셋만 실행
+    # 2. Run for a specific dataset
     python restore_raw_counts.py --dataset arc_h1
     python restore_raw_counts.py --dataset kolf_strong
 
-    # 3. 두 데이터셋 모두 실행
+    # 3. Run for both datasets
     python restore_raw_counts.py
 """
 
@@ -45,12 +46,12 @@ STANDARDIZED_DIR = "/mnt/nas2/projects/vcc-data/standardized"
 
 
 def restore_arc_h1(h5ad_path: str, dry_run: bool = False, backup_layer: bool = True) -> dict:
-    """arc_h1의 X (log1p CSR)를 expm1을 통해 raw integer count CSR로 변환"""
-    log.info(f"\n[arc_h1] 검사 및 변환: {h5ad_path}")
+    """Restores X in arc_h1 from log1p CSR to raw integer count CSR using expm1."""
+    log.info(f"\n[arc_h1] Inspecting and restoring: {h5ad_path}")
 
     with h5py.File(h5ad_path, "r") as f:
         if "X" not in f or not isinstance(f["X"], h5py.Group) or "data" not in f["X"]:
-            log.error("  [arc_h1] X CSR 그룹을 찾을 수 없습니다.")
+            log.error("  [arc_h1] Cannot locate X CSR group.")
             return {"dataset": "arc_h1", "status": "error", "reason": "invalid X structure"}
 
         sample_d = f["X"]["data"][:20]
@@ -58,27 +59,27 @@ def restore_arc_h1(h5ad_path: str, dry_run: bool = False, backup_layer: bool = T
         round_sample = np.round(expm1_sample)
         max_diff = float(np.max(np.abs(expm1_sample - round_sample)))
 
-        log.info(f"  현재 X data 샘플 (log1p): {sample_d[:5].tolist()}")
-        log.info(f"  복원될 raw counts 샘플  : {round_sample[:5].tolist()}")
-        log.info(f"  정수 반올림 최대 오차     : {max_diff:.2e} (부동소수점 정밀도 일치)")
+        log.info(f"  Current X data sample (log1p) : {sample_d[:5].tolist()}")
+        log.info(f"  Restored raw counts sample    : {round_sample[:5].tolist()}")
+        log.info(f"  Max integer rounding diff     : {max_diff:.2e} (matches float precision)")
 
         n_elements = len(f["X"]["data"])
-        log.info(f"  총 non-zero 요소 수: {n_elements:,}개")
+        log.info(f"  Total non-zero elements: {n_elements:,}")
 
     if dry_run:
-        log.info("  [DRY-RUN] 실제 수정을 생략합니다.")
+        log.info("  [DRY-RUN] Save skipped.")
         return {"dataset": "arc_h1", "status": "dry_run", "max_diff": max_diff}
 
     t0 = time.time()
     tmp_path = h5ad_path + ".raw_tmp"
-    log.info(f"  임시 파일 복사 중: {tmp_path}")
+    log.info(f"  Copying to temporary file: {tmp_path}")
     shutil.copyfile(h5ad_path, tmp_path)
 
     try:
         with h5py.File(tmp_path, "a") as f:
             x_grp = f["X"]
 
-            # 1. 기존 log1p X 백업
+            # 1. Back up original log1p X
             if backup_layer:
                 if "layers" not in f:
                     f.create_group("layers")
@@ -92,10 +93,10 @@ def restore_arc_h1(h5ad_path: str, dry_run: bool = False, backup_layer: bool = T
 
                 for ds_name in ["data", "indices", "indptr"]:
                     log1p_layer.create_dataset(ds_name, data=x_grp[ds_name][:])
-                log.info("  기존 log1p X를 layers['log1p']에 백업 완료")
+                log.info("  Original log1p X backed up to layers['log1p']")
 
-            # 2. X['data']를 청크 단위로 expm1 및 round 적용하여 in-place 갱신
-            log.info("  X['data'] expm1 변환 및 정수화 진행 중...")
+            # 2. Update X['data'] in-place using chunked expm1 and rounding
+            log.info("  Applying expm1 and integer rounding to X['data']...")
             data_ds = x_grp["data"]
             chunk_size = 5_000_000
 
@@ -105,12 +106,11 @@ def restore_arc_h1(h5ad_path: str, dry_run: bool = False, backup_layer: bool = T
                 restored = np.round(np.expm1(chunk)).astype(np.float32)
                 data_ds[i:end] = restored
 
-            # 속성 업데이트 (encoding-type 등 유지 확인)
             x_grp.attrs["is_raw"] = True
 
         shutil.move(tmp_path, h5ad_path)
         elapsed = time.time() - t0
-        log.info(f"  [arc_h1] raw count 복원 완료! ({elapsed:.1f}초)")
+        log.info(f"  [arc_h1] Raw counts restored successfully! ({elapsed:.1f}s)")
 
     except Exception as e:
         if os.path.exists(tmp_path):
@@ -121,40 +121,40 @@ def restore_arc_h1(h5ad_path: str, dry_run: bool = False, backup_layer: bool = T
 
 
 def restore_kolf_strong(h5ad_path: str, dry_run: bool = False, backup_layer: bool = True) -> dict:
-    """kolf_strong의 layers['counts'] (raw UMI counts)로 X를 교체"""
-    log.info(f"\n[kolf_strong] 검사 및 변환: {h5ad_path}")
+    """Replaces X in kolf_strong with layers['counts'] (raw UMI counts)."""
+    log.info(f"\n[kolf_strong] Inspecting and restoring: {h5ad_path}")
 
     with h5py.File(h5ad_path, "r") as f:
         if "layers" not in f or "counts" not in f["layers"]:
-            log.error("  [kolf_strong] layers['counts']를 찾을 수 없습니다.")
+            log.error("  [kolf_strong] Cannot locate layers['counts'].")
             return {"dataset": "kolf_strong", "status": "error", "reason": "no layers['counts']"}
 
         counts_grp = f["layers"]["counts"]
         sample_counts = counts_grp["data"][:20]
         is_int = bool(np.all(sample_counts == np.round(sample_counts)))
 
-        log.info(f"  layers['counts'] 샘플: {sample_counts[:5].tolist()}")
-        log.info(f"  카운트 정수 여부      : {is_int}")
+        log.info(f"  layers['counts'] sample : {sample_counts[:5].tolist()}")
+        log.info(f"  Integer counts verified : {is_int}")
 
         if "X" in f and isinstance(f["X"], h5py.Group) and "data" in f["X"]:
             sample_curr_x = f["X"]["data"][:5]
-            log.info(f"  현재 X data 샘플      : {sample_curr_x.tolist()} (z-normalized)")
+            log.info(f"  Current X data sample   : {sample_curr_x.tolist()} (z-normalized)")
 
         n_elements = len(counts_grp["data"])
-        log.info(f"  총 non-zero 요소 수: {n_elements:,}개")
+        log.info(f"  Total non-zero elements: {n_elements:,}")
 
     if dry_run:
-        log.info("  [DRY-RUN] 실제 수정을 생략합니다.")
+        log.info("  [DRY-RUN] Save skipped.")
         return {"dataset": "kolf_strong", "status": "dry_run", "is_int": is_int}
 
     t0 = time.time()
     tmp_path = h5ad_path + ".raw_tmp"
-    log.info(f"  임시 파일 복사 중 (21GB): {tmp_path}")
+    log.info(f"  Copying to temporary file: {tmp_path}")
     shutil.copyfile(h5ad_path, tmp_path)
 
     try:
         with h5py.File(tmp_path, "a") as f:
-            # 1. 기존 X를 layers['normalized']로 백업
+            # 1. Back up original X to layers['normalized']
             if backup_layer:
                 layers = f["layers"]
                 if "normalized" in layers:
@@ -167,9 +167,9 @@ def restore_kolf_strong(h5ad_path: str, dry_run: bool = False, backup_layer: boo
 
                 for ds_name in ["data", "indices", "indptr"]:
                     norm_layer.create_dataset(ds_name, data=x_grp[ds_name][:])
-                log.info("  기존 X를 layers['normalized']에 백업 완료")
+                log.info("  Original X backed up to layers['normalized']")
 
-            # 2. X 삭제 후 layers['counts']로 재작성
+            # 2. Replace X with layers['counts']
             del f["X"]
             new_x = f.create_group("X")
             counts_grp = f["layers"]["counts"]
@@ -186,11 +186,11 @@ def restore_kolf_strong(h5ad_path: str, dry_run: bool = False, backup_layer: boo
                 )
 
             new_x.attrs["is_raw"] = True
-            log.info("  layers['counts']를 X로 복사/교체 완료")
+            log.info("  layers['counts'] copied to X")
 
         shutil.move(tmp_path, h5ad_path)
         elapsed = time.time() - t0
-        log.info(f"  [kolf_strong] raw count 복원 완료! ({elapsed:.1f}초)")
+        log.info(f"  [kolf_strong] Raw counts restored successfully! ({elapsed:.1f}s)")
 
     except Exception as e:
         if os.path.exists(tmp_path):
@@ -201,12 +201,12 @@ def restore_kolf_strong(h5ad_path: str, dry_run: bool = False, backup_layer: boo
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="arc_h1 및 kolf_strong의 X를 raw count로 복원/교체")
+    p = argparse.ArgumentParser(description="Restore/replace expression matrix X with raw UMI counts for arc_h1 and kolf_strong")
     p.add_argument("--dataset", choices=["arc_h1", "kolf_strong", "all"], default="all",
-                   help="처리할 데이터셋 (arc_h1, kolf_strong, all)")
-    p.add_argument("--input-dir", default=STANDARDIZED_DIR, help="표준화 디렉토리 경로")
-    p.add_argument("--no-backup", action="store_true", help="기존 normalized/log1p layer 백업 생략")
-    p.add_argument("--dry-run", action="store_true", help="실제 변경 없이 데이터 샘플 및 정밀도 확인")
+                   help="Dataset to process (arc_h1, kolf_strong, or all)")
+    p.add_argument("--input-dir", default=STANDARDIZED_DIR, help="Standardized directory path")
+    p.add_argument("--no-backup", action="store_true", help="Skip backing up original matrix to layers")
+    p.add_argument("--dry-run", action="store_true", help="Preview data samples and precision without saving")
     return p.parse_args()
 
 
@@ -215,15 +215,15 @@ def main():
     backup_layer = not args.no_backup
 
     targets = ["arc_h1", "kolf_strong"] if args.dataset == "all" else [args.dataset]
-    log.info(f"Raw Count 복원 작업 시작: {targets}")
-    log.info(f"디렉토리: {args.input_dir}")
-    log.info(f"Dry-run 여부: {args.dry_run}, Layer 백업: {backup_layer}")
+    log.info(f"Raw Count Restoration: {targets}")
+    log.info(f"Directory: {args.input_dir}")
+    log.info(f"Dry-run: {args.dry_run}, Layer backup: {backup_layer}")
 
     results = []
     for ds in targets:
         h5ad_path = os.path.join(args.input_dir, f"{ds}_standardized.h5ad")
         if not os.path.exists(h5ad_path):
-            log.error(f"파일이 존재하지 않습니다: {h5ad_path}")
+            log.error(f"File not found: {h5ad_path}")
             results.append({"dataset": ds, "status": "missing"})
             continue
 
@@ -234,16 +234,16 @@ def main():
                 r = restore_kolf_strong(h5ad_path, dry_run=args.dry_run, backup_layer=backup_layer)
             results.append(r)
         except Exception as e:
-            log.error(f"[{ds}] 처리 중 오류 발생: {e}", exc_info=True)
+            log.error(f"[{ds}] ERROR: {e}", exc_info=True)
             results.append({"dataset": ds, "status": "error", "reason": str(e)})
 
     log.info("\n" + "=" * 55)
-    log.info("결과 요약:")
-    log.info(f"{'데이터셋':<20} {'상태':<12} {'소요시간/결과'}")
+    log.info("Results Summary:")
+    log.info(f"{'Dataset':<20} {'Status':<12} {'Elapsed/Details'}")
     log.info("-" * 55)
     for r in results:
         status = r.get("status", "?")
-        desc = f"{r.get('elapsed_sec', 0)}초" if "elapsed_sec" in r else r.get("reason", "")
+        desc = f"{r.get('elapsed_sec', 0)}s" if "elapsed_sec" in r else r.get("reason", "")
         log.info(f"  {r['dataset']:<18} {status:<12} {desc}")
 
 
