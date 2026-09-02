@@ -1,19 +1,19 @@
 """
 process_h5ad.py  (v4 - Filtering ONLY overlapping standard genes, No zero padding)
 ----------------------------------------------------------------------------------
-각 h5ad 파일을 VCC 2026 표준 gene 18,533개와 비교하여:
-  1. gene symbol을 GENCODE v32로 rename (JSON의 gene_conversion 필드 활용)
-  2. standard gene 목록에 존재하는 gene만 filtering (없는 gene은 0-padding 없이 아예 제외)
-  3. 겹치는 gene들의 순서를 standard gene_names.csv의 상대적 순서에 맞게 정렬
-  4. 최종 h5ad 저장 (Shape: n_cells × n_overlap_genes)
+Compares each h5ad file against the 18,533 VCC 2026 standard genes:
+  1. Renames gene symbols to GENCODE v32 (using the gene_conversion field in metadata JSON)
+  2. Filters to keep only genes present in the standard gene list (non-standard genes excluded without zero-padding)
+  3. Reorders overlapping genes to match the relative order of the standard gene_names.csv
+  4. Saves standardized h5ad (Shape: n_cells × n_overlap_genes)
 
-메모리 최적화:
-  - IncrementalCSRWriter를 사용하여 청크 단위로 h5py에 직접 기록 (RAM 피크 수백 MB 이하)
-  - Dense / CSR / CSC sparse matrix 및 Layer 모두 지원
+Memory Optimizations:
+  - Writes incrementally to h5py in chunks via IncrementalCSRWriter (peak RAM < a few hundred MBs)
+  - Supports Dense / CSR / CSC sparse matrix representations and layers
 
 Usage:
-    /home/dev02/miniconda3/envs/prophet_env/bin/python process_h5ad.py --dataset nadig_hepg2 --chunk-size 5000 --overwrite
-    /home/dev02/miniconda3/envs/prophet_env/bin/python process_h5ad.py --chunk-size 5000
+    python process_h5ad.py --dataset nadig_hepg2 --chunk-size 5000 --overwrite
+    python process_h5ad.py --chunk-size 5000
 """
 
 import argparse
@@ -30,6 +30,9 @@ import scipy.sparse as sp
 import h5py
 import anndata as ad
 
+# Enable AnnData nullable string (pandas StringArray) writing support
+ad.settings.allow_write_nullable_strings = True
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -39,22 +42,22 @@ log = logging.getLogger(__name__)
 
 
 # ============================================================
-# 1. 표준 gene 목록 로드
+# 1. Load Standard Gene List
 # ============================================================
 
 def load_standard_genes(gene_names_csv: str) -> list:
     df = pd.read_csv(gene_names_csv)
     genes = df.iloc[:, 0].dropna().astype(str).tolist()
-    log.info(f"표준 gene 수: {len(genes):,}개")
+    log.info(f"Standard gene count: {len(genes):,}")
     return genes
 
 
 # ============================================================
-# 2. gene conversion 딕셔너리 구축
+# 2. Build Gene Conversion Dictionary
 # ============================================================
 
 def build_conversion_dict(meta_entry: dict) -> dict:
-    """JSON의 gene_conversion 사용. 없으면 identity."""
+    """Use gene_conversion from JSON if available, otherwise identity."""
     conv = meta_entry.get("gene_conversion", None)
     if conv is not None:
         return conv
@@ -62,18 +65,18 @@ def build_conversion_dict(meta_entry: dict) -> dict:
 
 
 # ============================================================
-# 3. 인덱스 매핑 (Overlap 유전자만 추출)
+# 3. Index Mapping (Extract Overlapping Genes Only)
 # ============================================================
 
 def compute_index_mapping(src_genes: list, conversion: dict, std_genes: list):
     """
-    표준 유전자 순서(std_genes)를 기준으로 원본에 존재하는 유전자만 추출.
-    (0-padding 없이 오직 겹치는 유전자들만 필터링)
+    Extracts only genes existing in the source dataset based on standard gene order.
+    (Filters overlapping genes only, without zero-padding)
 
     Returns:
-        src_col_indices: 원본 matrix에서 가져올 column 인덱스 (길이 = n_overlap)
-        dest_col_indices: 결과 matrix(0 ~ n_overlap-1)에 배치할 column 인덱스
-        overlap_genes: 겹치는 유전자 이름 리스트 (표준 순서 유지)
+        src_col_indices: Column indices to extract from source matrix (length = n_overlap)
+        dest_col_indices: Destination column indices (0 to n_overlap - 1)
+        overlap_genes: List of overlapping gene names (maintains standard order)
     """
     converted = [conversion.get(g, g) for g in src_genes]
     src_to_idx = {}
@@ -95,13 +98,13 @@ def compute_index_mapping(src_genes: list, conversion: dict, std_genes: list):
 
 
 # ============================================================
-# 4. IncrementalCSRWriter: h5py에 CSR을 chunk별로 직접 append
+# 4. IncrementalCSRWriter: Append CSR chunks directly to h5py
 # ============================================================
 
 class IncrementalCSRWriter:
     """
-    h5py Group에 CSR sparse matrix를 incremental하게 append.
-    전체 matrix를 RAM에 올리지 않아도 됨.
+    Incrementally appends CSR sparse matrices to an h5py Group.
+    Avoids loading the entire matrix into RAM.
     """
 
     def __init__(self, h5grp: h5py.Group, n_cols: int, expected_cells: int,
@@ -124,7 +127,7 @@ class IncrementalCSRWriter:
             chunks=(1 << 16,), compression="gzip", compression_opts=4)
         self.ds_indptr[0] = 0
 
-        # anndata 호환 attributes
+        # anndata compatible attributes
         h5grp.attrs["encoding-type"]    = "csr_matrix"
         h5grp.attrs["encoding-version"] = "0.1.0"
         h5grp.attrs["shape"]            = [expected_cells, n_cols]
@@ -152,15 +155,15 @@ class IncrementalCSRWriter:
 
     def finalize(self):
         self.grp.attrs["shape"] = [self._n_rows, self.n_cols]
-        log.info(f"  Writer 완료: {self._n_rows:,} rows, {self._nnz:,} nnz (cols: {self.n_cols:,})")
+        log.info(f"  Writer completed: {self._n_rows:,} rows, {self._nnz:,} nnz (cols: {self.n_cols:,})")
 
 
 # ============================================================
-# 5. 내부 처리 함수 (재사용 가능한 핵심 로직)
+# 5. Internal Processing Functions
 # ============================================================
 
 def _build_lookup(src_col_indices, dest_col_indices, n_src_hint: int = 0) -> tuple:
-    """numpy lookup 배열 생성: lookup[src_idx] = dest_idx (없으면 -1)"""
+    """Generate numpy lookup array: lookup[src_idx] = dest_idx (or -1 if missing)"""
     n_safe = max(
         int(src_col_indices.max()) + 1 if len(src_col_indices) > 0 else 1,
         n_src_hint
@@ -172,7 +175,7 @@ def _build_lookup(src_col_indices, dest_col_indices, n_src_hint: int = 0) -> tup
 
 def _write_dense(dset, n_cells: int, src_col_indices, dest_col_indices,
                  n_overlap: int, chunk_size: int, writer: IncrementalCSRWriter):
-    """Dense matrix에서 overlapping column만 읽어 writer에 append."""
+    """Read only overlapping columns from dense matrix and append to writer."""
     sort_order  = np.argsort(src_col_indices)
     sorted_src  = src_col_indices[sort_order]
     sorted_dest = dest_col_indices[sort_order]
@@ -181,7 +184,7 @@ def _write_dense(dset, n_cells: int, src_col_indices, dest_col_indices,
         end = min(start + chunk_size, n_cells)
         n_r = end - start
 
-        # 필요한 overlapping column만 슬라이싱
+        # Slice required overlapping columns only
         sel = dset[start:end, sorted_src]
 
         out = np.zeros((n_r, n_overlap), dtype=np.float32)
@@ -198,7 +201,7 @@ def _write_dense(dset, n_cells: int, src_col_indices, dest_col_indices,
 
 def _write_sparse_csr(grp, n_cells: int, lookup, n_src_safe: int,
                       n_overlap: int, chunk_size: int, writer: IncrementalCSRWriter):
-    """CSR sparse matrix에서 overlapping gene만 필터링하여 writer에 append."""
+    """Filter overlapping genes from CSR sparse matrix and append to writer."""
     data_arr    = grp["data"]
     indices_arr = grp["indices"]
     indptr_arr  = grp["indptr"]
@@ -238,10 +241,10 @@ def _write_sparse_csr(grp, n_cells: int, lookup, n_src_safe: int,
 
 def _write_sparse_csc(grp, n_cells: int, src_col_indices, dest_col_indices,
                       n_overlap: int, chunk_size: int, writer: IncrementalCSRWriter):
-    """CSC sparse matrix에서 overlapping column만 추출하여 CSR writer에 append."""
+    """Extract overlapping columns from CSC sparse matrix and append to CSR writer."""
     data_arr    = grp["data"]
-    indices_arr = grp["indices"]   # row 인덱스
-    indptr_arr  = grp["indptr"]    # column별 시작 위치
+    indices_arr = grp["indices"]   # row indices
+    indptr_arr  = grp["indptr"]    # column start pointers
     n_src_cols  = len(indptr_arr) - 1
 
     all_rows, all_dests, all_vals = [], [], []
@@ -286,7 +289,7 @@ def _write_sparse_csc(grp, n_cells: int, src_col_indices, dest_col_indices,
 
 
 # ============================================================
-# 6. X 및 Layer 처리 dispatcher
+# 6. X and Layer Processing Dispatcher
 # ============================================================
 
 def process_X_to_h5(h5src: h5py.File, n_cells: int,
@@ -312,7 +315,7 @@ def process_X_to_h5(h5src: h5py.File, n_cells: int,
             _write_sparse_csc(x, n_cells, src_col_indices, dest_col_indices,
                               n_overlap, chunk_size, writer)
         else:
-            log.warning(f"  X: 알 수 없는 encoding '{enc}'")
+            log.warning(f"  X: Unknown encoding '{enc}'")
     else:
         log.info("  X: dense")
         _write_dense(x, n_cells, src_col_indices, dest_col_indices, n_overlap, chunk_size, writer)
@@ -324,7 +327,7 @@ def process_layer_to_h5(h5src: h5py.File, layer_key: str,
                           writer: IncrementalCSRWriter,
                           n_src_genes: int = None):
     layer = h5src["layers"][layer_key]
-    log.info(f"  Layer '{layer_key}' 처리 중...")
+    log.info(f"  Processing Layer '{layer_key}'...")
 
     if isinstance(layer, h5py.Group):
         enc = layer.attrs.get("encoding-type", "")
@@ -337,17 +340,17 @@ def process_layer_to_h5(h5src: h5py.File, layer_key: str,
             _write_sparse_csc(layer, n_cells, src_col_indices, dest_col_indices,
                               n_overlap, chunk_size, writer)
         else:
-            log.warning(f"  Layer '{layer_key}': 알 수 없는 encoding '{enc}', 건너뜀")
+            log.warning(f"  Layer '{layer_key}': Unknown encoding '{enc}', skipped")
     else:
         _write_dense(layer, n_cells, src_col_indices, dest_col_indices, n_overlap, chunk_size, writer)
 
 
 # ============================================================
-# 7. var DataFrame 재구성 (Overlap 유전자만 포함)
+# 7. Reconstruct var DataFrame (Overlapping Genes Only)
 # ============================================================
 
 def build_new_var(src_var: pd.DataFrame, src_genes: list, conversion: dict, overlap_genes: list) -> pd.DataFrame:
-    """겹치는 표준 gene 목록에 대해서만 var DataFrame 생성."""
+    """Build var DataFrame containing only overlapping standard genes."""
     converted = [conversion.get(g, g) for g in src_genes]
     rv = src_var.copy()
     rv.index = converted
@@ -374,33 +377,33 @@ def build_new_var(src_var: pd.DataFrame, src_genes: list, conversion: dict, over
 
 
 # ============================================================
-# 8. 단일 데이터셋 처리 메인 함수
+# 8. Single Dataset Processing Function
 # ============================================================
 
 def process_dataset(name: str, meta_entry: dict, std_genes: list, output_dir: str,
                     chunk_size: int = 2000, overwrite: bool = False) -> dict:
     """
-    단일 데이터셋을 표준 gene과 겹치는 gene만 필터링하여 저장.
-    Shape: n_cells × n_overlap (0-padding 없음)
+    Standardizes a single dataset by filtering to keep only overlapping standard genes.
+    Shape: n_cells × n_overlap (No zero-padding)
     """
     h5ad_path   = meta_entry["h5ad_path"]
     output_path = os.path.join(output_dir, f"{name}_standardized.h5ad")
 
     if not overwrite and os.path.exists(output_path):
-        log.info(f"[{name}] 이미 존재, 건너뜀: {output_path}")
+        log.info(f"[{name}] Already exists, skipping: {output_path}")
         return {"name": name, "status": "skipped", "output": output_path}
 
     log.info(f"\n{'='*60}")
-    log.info(f"[{name}] 시작: {h5ad_path}")
+    log.info(f"[{name}] Starting: {h5ad_path}")
     t0 = time.time()
 
     src_genes  = meta_entry["gene"]
     conversion = build_conversion_dict(meta_entry)
     src_col_indices, dest_col_indices, overlap_genes = compute_index_mapping(src_genes, conversion, std_genes)
     n_overlap  = len(overlap_genes)
-    log.info(f"[{name}] 원본 {len(src_genes):,}개 중 표준 일치 gene: {n_overlap:,}개 필터링 (0-padding 없음)")
+    log.info(f"[{name}] Filtered {n_overlap:,} overlapping standard genes out of {len(src_genes):,} original genes (no zero-padding)")
 
-    # obs/var/uns/obsm 로드
+    # Load obs/var/uns/obsm
     al = ad.read_h5ad(h5ad_path, backed="r")
     obs      = al.obs.copy()
     src_var  = al.var.copy()
@@ -411,6 +414,12 @@ def process_dataset(name: str, meta_entry: dict, std_genes: list, output_dir: st
     del al
     gc.collect()
 
+    # Sanitize obs index and column dtypes (ensures StringArray compatibility for mixscale etc.)
+    obs.index = obs.index.astype(str)
+    for col in obs.columns:
+        if isinstance(obs[col].dtype, pd.StringDtype) or obs[col].dtype == "string":
+            obs[col] = obs[col].astype(str)
+
     n_cells = len(obs)
     log.info(f"[{name}] {n_cells:,} cells, layers: {layer_keys}")
 
@@ -418,11 +427,11 @@ def process_dataset(name: str, meta_entry: dict, std_genes: list, output_dir: st
     tmp_path = output_path + ".tmp"
     new_var  = build_new_var(src_var, src_genes, conversion, overlap_genes)
 
-    # 골격 먼저 저장
+    # Write skeletal AnnData structure first
     ad.AnnData(obs=obs, var=new_var, uns=uns, obsm=obsm).write_h5ad(tmp_path)
     gc.collect()
 
-    # h5py로 X + layers를 incremental write (Shape: n_cells × n_overlap)
+    # Incrementally write X + layers via h5py (Shape: n_cells × n_overlap)
     with h5py.File(h5ad_path, "r") as h5src, h5py.File(tmp_path, "a") as h5dst:
 
         # X
@@ -449,29 +458,29 @@ def process_dataset(name: str, meta_entry: dict, std_genes: list, output_dir: st
 
     shutil.move(tmp_path, output_path)
     elapsed = time.time() - t0
-    log.info(f"[{name}] 완료: {output_path} ({n_cells:,}×{n_overlap:,}, {elapsed:.1f}s)")
+    log.info(f"[{name}] Finished: {output_path} ({n_cells:,}×{n_overlap:,}, {elapsed:.1f}s)")
 
     return {"name": name, "status": "done", "output": output_path,
             "n_cells": n_cells, "n_overlap_genes": n_overlap, "elapsed_sec": elapsed}
 
 
 # ============================================================
-# 9. JSON gene_conversion 업데이트
+# 9. Update JSON gene_conversion
 # ============================================================
 
 def update_json_with_conversions(json_path: str, gtf_gz_path: str):
-    """각 entry에 gene_conversion 필드를 추가."""
-    log.info("gene_conversion 계산 시작...")
+    """Add gene_conversion field to each dataset entry in metadata JSON."""
+    log.info("Computing gene_conversion mappings...")
     from gtfparse import read_gtf
     import mygene
 
-    log.info("GTF 로딩 중...")
+    log.info("Loading GTF...")
     gtf_df   = read_gtf(gtf_gz_path).to_pandas()
     genes_df = gtf_df[gtf_df["feature"] == "gene"].copy()
     genes_df["ensembl_base"] = genes_df["gene_id"].str.split(".").str[0]
     ens2v32  = dict(zip(genes_df["ensembl_base"], genes_df["gene_name"]))
     v32_set  = set(genes_df["gene_name"])
-    log.info(f"GTF 완료: {len(v32_set):,} symbols")
+    log.info(f"GTF loaded: {len(v32_set):,} symbols")
 
     with open(json_path) as f:
         meta = json.load(f)
@@ -479,12 +488,12 @@ def update_json_with_conversions(json_path: str, gtf_gz_path: str):
     mg = mygene.MyGeneInfo()
     for name, entry in meta.items():
         if "gene_conversion" in entry:
-            log.info(f"[{name}] 이미 존재")
+            log.info(f"[{name}] gene_conversion already exists")
             continue
         gene_list  = entry["gene"]
         mismatched = [g for g in gene_list if g not in v32_set]
         conv       = {g: g for g in gene_list}
-        log.info(f"[{name}] mygene 조회 {len(mismatched):,}개...")
+        log.info(f"[{name}] Querying mygene for {len(mismatched):,} mismatched symbols...")
         if mismatched:
             for res in mg.querymany(mismatched, scopes="symbol,alias",
                                     fields="ensembl.gene", species="human", verbose=False):
@@ -498,17 +507,17 @@ def update_json_with_conversions(json_path: str, gtf_gz_path: str):
                             break
         entry["gene_conversion"] = conv
         changed = sum(1 for k, v in conv.items() if k != v)
-        log.info(f"[{name}] 변환 {changed:,}개")
+        log.info(f"[{name}] Converted {changed:,} gene symbols")
 
     try:
         shutil.copyfile(json_path, json_path + ".bak")
-        log.info(f"원본 JSON 백업: {json_path}.bak")
+        log.info(f"Original JSON backed up: {json_path}.bak")
     except Exception as e:
-        log.warning(f"JSON 백업 생략 (권한 제한): {e}")
+        log.warning(f"JSON backup skipped (permission restriction): {e}")
 
     with open(json_path, "w") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
-    log.info(f"JSON 저장 완료: {json_path}")
+    log.info(f"JSON saved successfully: {json_path}")
 
 
 # ============================================================
@@ -516,17 +525,24 @@ def update_json_with_conversions(json_path: str, gtf_gz_path: str):
 # ============================================================
 
 def parse_args():
-    p = argparse.ArgumentParser(description="h5ad VCC 표준 gene 필터링 변환 (0-padding 없음)")
-    p.add_argument("--meta-json",  default="/mnt/nas2/projects/vcc-data/datasets_meta.json")
-    p.add_argument("--gene-csv",   default="/mnt/nas2/projects/vcc-data/vcc-2026/gene_names.csv")
-    p.add_argument("--output-dir", default="/mnt/nas2/projects/vcc-data/standardized")
+    p = argparse.ArgumentParser(description="Filter and standardize h5ad files against VCC standard genes (no zero-padding)")
+    p.add_argument("--meta-json",  default="/mnt/nas2/projects/vcc-data/datasets_meta.json",
+                   help="Path to metadata JSON")
+    p.add_argument("--gene-csv",   default="/mnt/nas2/projects/vcc-data/vcc-2026/gene_names.csv",
+                   help="Path to standard gene list CSV")
+    p.add_argument("--output-dir", default="/mnt/nas2/projects/vcc-data/standardized",
+                   help="Directory to save standardized h5ad files")
     p.add_argument("--gtf-gz",
-                   default="/home/dev02/integration/gencode/gencode.v32.primary_assembly.annotation.gtf.gz")
-    p.add_argument("--dataset",    default=None)
+                   default="/home/dev02/integration/gencode/gencode.v32.primary_assembly.annotation.gtf.gz",
+                   help="Path to GENCODE v32 GTF")
+    p.add_argument("--dataset",    default=None,
+                   help="Process a specific dataset only")
     p.add_argument("--chunk-size", type=int, default=2000,
-                   help="row chunk 크기 (RAM 여유 시 5000~10000 권장)")
-    p.add_argument("--overwrite",  action="store_true")
-    p.add_argument("--update-json-only", action="store_true")
+                   help="Row chunk size for incremental writing (5000-10000 recommended if RAM permits)")
+    p.add_argument("--overwrite",  action="store_true",
+                   help="Overwrite existing output files")
+    p.add_argument("--update-json-only", action="store_true",
+                   help="Only compute and update gene_conversion in metadata JSON")
     return p.parse_args()
 
 
@@ -541,16 +557,16 @@ def main():
     if args.update_json_only:
         needs = [n for n, e in meta.items() if "gene_conversion" not in e]
         if needs:
-            log.info(f"gene_conversion 미계산: {needs}")
+            log.info(f"Uncomputed gene_conversion: {needs}")
             update_json_with_conversions(args.meta_json, args.gtf_gz)
-        log.info("--update-json-only 완료")
+        log.info("--update-json-only completed")
         return
 
     if args.dataset is None:
         needs = [n for n, e in meta.items() if "gene_conversion" not in e]
         if needs:
-            log.info(f"gene_conversion 미계산 ({len(needs)}개): {needs}")
-            log.info("GTF + mygene API로 자동 계산합니다...")
+            log.info(f"Uncomputed gene_conversion ({len(needs)} datasets): {needs}")
+            log.info("Computing automatically using GTF + mygene API...")
             update_json_with_conversions(args.meta_json, args.gtf_gz)
             with open(args.meta_json) as f:
                 meta = json.load(f)
@@ -569,7 +585,7 @@ def main():
             log.error(f"[{name}] ERROR: {e}", exc_info=True)
             results.append({"name": name, "status": "error", "error": str(e)})
 
-    log.info("\n" + "=" * 60 + "\n결과 요약:")
+    log.info("\n" + "=" * 60 + "\nResults Summary:")
     for r in results:
         s = r["status"]
         if s == "done":
