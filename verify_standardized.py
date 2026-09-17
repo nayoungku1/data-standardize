@@ -9,12 +9,19 @@ Validates that standardized h5ad files have been processed correctly:
   5. Verifies all datasets defined in datasets_meta.json are processed
 """
 
-import json
 import os
+os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
+
+import argparse
+import json
 import sys
 import pandas as pd
 import anndata as ad
 import numpy as np
+
+parser = argparse.ArgumentParser(description="Verify standardized h5ad files")
+parser.add_argument("--dataset", default=None, help="Specific dataset to verify (default: all)")
+args = parser.parse_args()
 
 META_JSON   = "/mnt/nas2/projects/vcc-data/datasets_meta.json"
 GENE_CSV    = "/mnt/nas2/projects/vcc-data/vcc-2026/gene_names.csv"
@@ -34,6 +41,12 @@ print(f"\n[Standard Genes] Total {len(std_genes):,} genes (gene_names.csv)")
 # 2. Load datasets_meta.json
 with open(META_JSON) as f:
     meta = json.load(f)
+
+if args.dataset:
+    if args.dataset not in meta:
+        print(f"Error: dataset '{args.dataset}' not found in {META_JSON}")
+        sys.exit(1)
+    meta = {args.dataset: meta[args.dataset]}
 
 print(f"[Metadata JSON] {len(meta)} datasets: {list(meta.keys())}")
 

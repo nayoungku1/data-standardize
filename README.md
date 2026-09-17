@@ -167,9 +167,12 @@ nohup uv run python -u process_h5ad.py \
 - **Purpose**: Computes perturbation-specific effect metrics (**logFC** and **delta**) for both normalized (Option A) and raw (Option B) counts relative to non-targeting controls (`target_gene == 'non-targeting'`) and stores them directly into `adata.uns` across standardized datasets (excluding `mixscale_*`).
   - **Metrics Computed**:
     - **Normalized (Option A)**:
-      - Cell library-size normalized to 10,000 counts (CP10k) and transformed via $\ln(1 + x)$.
-      - `delta_norm`: $\overline{\log1p(X_p)} - \overline{\log1p(X_{\text{ctrl}})}$
-      - `logfc_norm`: $\log_2(e) \times \text{delta\_norm}$
+      - Cell library-size normalized to 10,000 counts (CP10k) and transformed via $\ln(1 + x)$ (natural log):
+        $$X^{\text{norm}} = \ln\left(1 + \frac{X}{\sum X} \times 10{,}000\right)$$
+      - `delta_norm`: Difference in mean log-normalized expression:
+        $$\text{delta\_norm} = \overline{X_p^{\text{norm}}} - \overline{X_{\text{ctrl}}^{\text{norm}}}$$
+      - `logfc_norm`: $\log_2$ fold-change converted from natural log difference (Scanpy standard):
+        $$\text{logfc\_norm} = \log_2(e) \times \text{delta\_norm} = \frac{\text{delta\_norm}}{\ln(2)}$$
     - **Raw Counts (Option B)**:
       - Computed directly on raw integer expression matrix $X$:
       - `delta_raw`: $\overline{X_p} - \overline{X_{\text{ctrl}}}$
@@ -181,8 +184,9 @@ nohup uv run python -u process_h5ad.py \
     - Stored as 2D float32 matrices in `adata.uns['logfc_norm']`, `adata.uns['delta_norm']`, `adata.uns['logfc_raw']`, `adata.uns['delta_raw']` (shape: $n_{\text{perts}} \times n_{\text{genes}}$), with matching perturbation names in `adata.uns['perturbations']`.
     - Easily queried as a DataFrame via helper function `get_perturbation_effect(adata, 'logfc_norm')`.
     - Written in-place via `h5py` within seconds without rewriting $X$.
-  - **Target Datasets (10 datasets, strictly excluding `mixscale_*`)**:
-    - `kaggle`, `nadig_hepg2`, `nadig_jurkat`, `replogle_rpe1`, `replogle_k562_essential`, `replogle_k562_gwp`, `orion_hct116`, `orion_hek293t`, `arc_h1`, `kolf_strong`.
+  - **Target Datasets (16 datasets, strictly excluding `mixscale_*`)**:
+    - Standard (10): `kaggle`, `nadig_hepg2`, `nadig_jurkat`, `replogle_rpe1`, `replogle_k562_essential`, `replogle_k562_gwp`, `orion_hct116`, `orion_hek293t`, `arc_h1`, `kolf_strong`.
+    - PRISM (6, via `--prism`): `prism_gse210681`, `prism_gse221321`, `prism_gse208240`, `prism_gse150062`, `prism_gse261283`, `prism_gse165291`.
 - **Usage**:
   ```bash
   # Preview calculations on a single dataset without modifying file
