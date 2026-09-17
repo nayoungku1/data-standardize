@@ -70,6 +70,12 @@ DATASET_SRC_COL = {
     "mixscale_tnfa":           "gene",
     "arc_h1":                  "target_gene",   # Already named target_gene -> standardize values
     "kaggle":                  "sgrna_symbol",
+    "prism_gse210681":         "perturbation_name",
+    "prism_gse221321":         "perturbation_name",
+    "prism_gse208240":         "perturbation_name",
+    "prism_gse150062":         "perturbation_name",
+    "prism_gse261283":         "perturbation_name",
+    "prism_gse165291":         "perturbation_name",
 }
 
 # Dataset-specific extra non-targeting labels (lowercase)
@@ -239,6 +245,8 @@ def process_dataset(ds_name: str, entry: dict,
                     overwrite: bool = False) -> dict:
     h5ad_path = os.path.join(output_dir, f"{ds_name}_standardized.h5ad")
     src_col   = DATASET_SRC_COL.get(ds_name)
+    if src_col is None and ds_name.startswith("prism_"):
+        src_col = "perturbation_name"
 
     if not os.path.exists(h5ad_path):
         log.warning(f"[{ds_name}] File not found: {h5ad_path}")

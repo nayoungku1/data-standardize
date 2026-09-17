@@ -1,7 +1,7 @@
 """
 add_ensembl_id_to_var.py
 ------------------------
-Adds an 'ensembl_id' column to var in each standardized h5ad file.
+Adds an 'ensembl_id' column to var in each standardized h5ad file or arbitrary h5ad file.
 
 Queries Ensembl IDs from the GENCODE v32 GTF based on var's index
 (gene_name, GENCODE v32 symbol).
@@ -10,21 +10,33 @@ Queries Ensembl IDs from the GENCODE v32 GTF based on var's index
 - All existing var columns are preserved
 - Adds the dataset directly to the var group using h5py (X/layers untouched)
 - Encodes with AnnData 0.2.0 string-array specification to prevent byte-string decoding issues
+- By default, leaves the input raw file UNTOUCHED and writes the standardized result to --output-file or --output-dir.
+- Use --inplace only if you explicitly want to modify the input file directly.
 - --dry-run: Checks mapping coverage without saving
-- --overwrite: Overwrites existing ensembl_id column
+- --overwrite: Overwrites existing output file or ensembl_id column
 
 Usage:
+    # Process raw h5ad and save to standardized directory (Original file untouched):
+    python add_ensembl_id_to_var.py --h5ad /mnt/nas2/projects/vcc-data/vcc-2026/context_A.h5ad
+
+    # Process raw h5ad and save to specific output path:
+    python add_ensembl_id_to_var.py --h5ad /path/to/custom.h5ad --output-file /path/to/custom_standardized.h5ad
+
+    # In-place modification:
+    python add_ensembl_id_to_var.py --h5ad /path/to/custom.h5ad --inplace --overwrite
+
+    # Batch / dataset lookup in standardized directory:
     python add_ensembl_id_to_var.py
-    python add_ensembl_id_to_var.py --dry-run
     python add_ensembl_id_to_var.py --dataset nadig_hepg2
-    python add_ensembl_id_to_var.py --overwrite
 """
+
+import os
+os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
 
 import argparse
 import gzip
 import json
 import logging
-import os
 import shutil
 
 import h5py
@@ -88,17 +100,16 @@ def load_v32_name_to_ensembl(gtf_gz: str) -> dict:
 def get_var_gene_names(h5f: h5py.File) -> list:
     """Returns gene names (index order) from the var group."""
     var = h5f["var"]
-    if "_index" in var:
-        ds = var["_index"]
-        return [v.decode() if isinstance(v, bytes) else str(v) for v in ds[:]]
-    idx_name = var.attrs.get("_index", None)
+    idx_name = "_index" if "_index" in var else var.attrs.get("_index", None)
     if idx_name and idx_name in var:
         ds = var[idx_name]
         if isinstance(ds, h5py.Group):
-            # categorical
-            codes = ds["codes"][:]
-            cats  = [c.decode() if isinstance(c, bytes) else str(c) for c in ds["categories"][:]]
-            return [cats[c] for c in codes]
+            if "values" in ds:
+                return [v.decode() if isinstance(v, bytes) else str(v) for v in ds["values"][:]]
+            elif "codes" in ds:
+                codes = ds["codes"][:]
+                cats  = [c.decode() if isinstance(c, bytes) else str(c) for c in ds["categories"][:]]
+                return [cats[c] for c in codes]
         else:
             return [v.decode() if isinstance(v, bytes) else str(v) for v in ds[:]]
     raise ValueError(f"Cannot locate gene index in var. keys={list(var.keys())}, attrs={dict(var.attrs)}")
@@ -108,15 +119,25 @@ def get_var_gene_names(h5f: h5py.File) -> list:
 # 3. Single Dataset Processing
 # ============================================================
 
-def process_dataset(ds_name: str, h5ad_path: str,
+def process_dataset(ds_name: str, input_h5ad: str, output_h5ad: str,
                     name2ens: dict,
                     dry_run: bool = False,
                     overwrite: bool = False) -> dict:
-    log.info(f"\n[{ds_name}] Processing: {h5ad_path}")
+    log.info(f"\n[{ds_name}] Processing: {input_h5ad}")
+    if input_h5ad != output_h5ad:
+        log.info(f"  Target output: {output_h5ad}")
 
-    with h5py.File(h5ad_path, "r") as h5f:
-        # Check existing ensembl_id column
-        if "ensembl_id" in h5f["var"] and not overwrite:
+    if not os.path.exists(input_h5ad):
+        log.warning(f"  [{ds_name}] Input file does not exist: {input_h5ad}")
+        return {"dataset": ds_name, "status": "missing"}
+
+    if os.path.exists(output_h5ad) and input_h5ad != output_h5ad and not overwrite:
+        log.info(f"  [{ds_name}] Output file already exists: {output_h5ad}. Use --overwrite to replace.")
+        return {"dataset": ds_name, "status": "skipped", "reason": "output file exists"}
+
+    with h5py.File(input_h5ad, "r") as h5f:
+        # Check existing ensembl_id column if in-place
+        if "ensembl_id" in h5f["var"] and input_h5ad == output_h5ad and not overwrite:
             log.info(f"  [{ds_name}] 'ensembl_id' already exists in var. Use --overwrite to replace.")
             return {"dataset": ds_name, "status": "skipped", "reason": "already exists"}
 
@@ -145,9 +166,14 @@ def process_dataset(ds_name: str, h5ad_path: str,
             "n_unmapped": n_unmapped, "coverage_pct": round(coverage, 2),
         }
 
-    # Add var/ensembl_id using h5py
-    tmp_path = h5ad_path + ".varid_tmp"
-    shutil.copyfile(h5ad_path, tmp_path)
+    # Ensure output directory exists
+    out_dir = os.path.dirname(output_h5ad)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    # Copy input to temporary output file
+    tmp_path = output_h5ad + ".varid_tmp"
+    shutil.copyfile(input_h5ad, tmp_path)
 
     try:
         with h5py.File(tmp_path, "a") as h5f:
@@ -174,8 +200,8 @@ def process_dataset(ds_name: str, h5ad_path: str,
                     col_order.append("ensembl_id")
                 var_grp.attrs["column-order"] = col_order
 
-        shutil.move(tmp_path, h5ad_path)
-        log.info(f"  [{ds_name}] Saved successfully: {h5ad_path}")
+        shutil.move(tmp_path, output_h5ad)
+        log.info(f"  [{ds_name}] Saved successfully -> {output_h5ad}")
 
     except Exception as e:
         if os.path.exists(tmp_path):
@@ -194,43 +220,47 @@ def process_dataset(ds_name: str, h5ad_path: str,
 # ============================================================
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Add ensembl_id column to var in standardized h5ad files")
-    p.add_argument("--meta-json",  default=META_JSON, help="Path to metadata JSON")
-    p.add_argument("--gtf-gz",     default=GTF_GZ, help="Path to GENCODE v32 GTF")
-    p.add_argument("--output-dir", default=OUTPUT_DIR, help="Standardized h5ad directory")
-    p.add_argument("--dataset",    default=None, help="Process a specific dataset only")
-    p.add_argument("--dry-run",    action="store_true", help="Preview mapping coverage without saving")
-    p.add_argument("--overwrite",  action="store_true", help="Overwrite existing ensembl_id column")
+    p = argparse.ArgumentParser(description="Add ensembl_id column to var in standardized or custom h5ad files")
+    p.add_argument("--h5ad",        default=None, help="Direct path to an input h5ad file")
+    p.add_argument("--output-file", default=None, help="Explicit destination file path (leaves original input untouched)")
+    p.add_argument("--output-dir",  default=OUTPUT_DIR, help="Standardized output directory path (default: /mnt/nas2/projects/vcc-data/standardized)")
+    p.add_argument("--inplace",     action="store_true", help="Modify the input file directly in-place")
+    p.add_argument("--meta-json",   default=META_JSON, help="Path to metadata JSON")
+    p.add_argument("--gtf-gz",      default=GTF_GZ, help="Path to GENCODE v32 GTF")
+    p.add_argument("--dataset",     default=None, help="Process a specific dataset name or path")
+    p.add_argument("--dry-run",     action="store_true", help="Preview mapping coverage without saving")
+    p.add_argument("--overwrite",   action="store_true", help="Overwrite existing output file or ensembl_id column")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
 
-    with open(args.meta_json) as f:
-        meta = json.load(f)
-
     name2ens = load_v32_name_to_ensembl(args.gtf_gz)
-
-    targets = {args.dataset: meta[args.dataset]} if args.dataset else meta
-
     results = []
-    for ds_name in targets:
-        h5ad_path = os.path.join(args.output_dir, f"{ds_name}_standardized.h5ad")
 
-        if not os.path.exists(h5ad_path):
-            log.warning(f"[{ds_name}] File not found: {h5ad_path}")
-            results.append({"dataset": ds_name, "status": "missing"})
-            continue
+    # Case 1: Direct h5ad path via --h5ad or --dataset pointing to an existing file
+    target_h5ad = args.h5ad
+    if not target_h5ad and args.dataset and os.path.exists(args.dataset):
+        target_h5ad = args.dataset
 
-        if os.path.exists(h5ad_path + ".perttmp"):
-            log.warning(f"[{ds_name}] .perttmp file exists (active job?), skipping")
-            results.append({"dataset": ds_name, "status": "skipped", "reason": ".perttmp exists"})
-            continue
+    if target_h5ad:
+        if not os.path.exists(target_h5ad):
+            log.error(f"File not found: {target_h5ad}")
+            return
+        ds_name = args.dataset if (args.dataset and not os.path.exists(args.dataset)) else os.path.splitext(os.path.basename(target_h5ad))[0]
+
+        if args.output_file:
+            out_path = args.output_file
+        elif args.inplace:
+            out_path = target_h5ad
+        else:
+            clean_name = ds_name.replace("_standardized", "")
+            out_path = os.path.join(args.output_dir, f"{clean_name}_standardized.h5ad")
 
         try:
             r = process_dataset(
-                ds_name, h5ad_path, name2ens,
+                ds_name, target_h5ad, out_path, name2ens,
                 dry_run=args.dry_run,
                 overwrite=args.overwrite,
             )
@@ -238,6 +268,59 @@ def main():
         except Exception as e:
             log.error(f"[{ds_name}] ERROR: {e}", exc_info=True)
             results.append({"dataset": ds_name, "status": "error", "reason": str(e)})
+    else:
+        # Case 2: Use meta_json and output_dir
+        if not os.path.exists(args.meta_json):
+            log.error(f"Metadata JSON not found: {args.meta_json}")
+            return
+
+        with open(args.meta_json) as f:
+            meta = json.load(f)
+
+        if args.dataset:
+            if args.dataset not in meta:
+                h5ad_path = os.path.join(args.output_dir, f"{args.dataset}_standardized.h5ad")
+                if not os.path.exists(h5ad_path):
+                    h5ad_path = os.path.join(args.output_dir, f"{args.dataset}.h5ad")
+                if os.path.exists(h5ad_path):
+                    targets = {args.dataset: None}
+                else:
+                    log.error(f"Dataset '{args.dataset}' not found in {args.meta_json} nor in {args.output_dir}")
+                    return
+            else:
+                targets = {args.dataset: meta[args.dataset]}
+        else:
+            targets = meta
+
+        for ds_name in targets:
+            h5ad_path = os.path.join(args.output_dir, f"{ds_name}_standardized.h5ad")
+            if not os.path.exists(h5ad_path):
+                alt_path = os.path.join(args.output_dir, f"{ds_name}.h5ad")
+                if os.path.exists(alt_path):
+                    h5ad_path = alt_path
+
+            if not os.path.exists(h5ad_path):
+                log.warning(f"[{ds_name}] File not found: {h5ad_path}")
+                results.append({"dataset": ds_name, "status": "missing"})
+                continue
+
+            if os.path.exists(h5ad_path + ".perttmp"):
+                log.warning(f"[{ds_name}] .perttmp file exists (active job?), skipping")
+                results.append({"dataset": ds_name, "status": "skipped", "reason": ".perttmp exists"})
+                continue
+
+            out_path = args.output_file if args.output_file else h5ad_path
+
+            try:
+                r = process_dataset(
+                    ds_name, h5ad_path, out_path, name2ens,
+                    dry_run=args.dry_run,
+                    overwrite=args.overwrite,
+                )
+                results.append(r)
+            except Exception as e:
+                log.error(f"[{ds_name}] ERROR: {e}", exc_info=True)
+                results.append({"dataset": ds_name, "status": "error", "reason": str(e)})
 
     # Summary table
     log.info("\n" + "=" * 70)

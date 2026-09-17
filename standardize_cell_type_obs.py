@@ -1,7 +1,7 @@
 """
 standardize_cell_type_obs.py
 ----------------------------
-Standardizes or injects the 'cell_type' column in obs across standardized h5ad files.
+Standardizes or injects the 'cell_type' column in obs across standardized h5ad files or arbitrary h5ad files.
 
 Key Features:
   1. Missing cell_type: Generates a single-category categorical column with the specified cell_type name (e.g., 'hct116')
@@ -11,30 +11,35 @@ Key Features:
   3. Existing cell_type (e.g., mixscale_*, arc_h1):
      - Skips unless --overwrite is explicitly provided (safety mechanism)
 
-Processing Method:
-  - Writes AnnData Categorical specification (categories + codes) directly via h5py
-  - Does not load or touch large expression matrices (X, layers, var), making it extremely fast and lightweight
-  - Writes to a temporary copy first, followed by atomic rename for file safety
+Processing & Safety:
+  - By default, leaves the original raw input file UNTOUCHED and writes the standardized result to --output-file or --output-dir (e.g. /mnt/nas2/projects/vcc-data/standardized/<name>_standardized.h5ad).
+  - Use --inplace only if you explicitly want to modify the input file directly.
+  - Writes AnnData Categorical specification (categories + codes) directly via h5py (RAM/disk efficient)
 
 Usage:
-    # Add cell_type to a specific dataset
+    # Process raw h5ad and save to standardized directory (Original file untouched):
+    python standardize_cell_type_obs.py --h5ad /mnt/nas2/projects/vcc-data/vcc-2026/context_A.h5ad --cell-type CONTEXT_A
+
+    # Process raw h5ad and save to a specific output file:
+    python standardize_cell_type_obs.py --h5ad /path/to/sample.h5ad --output-file /path/to/sample_standardized.h5ad --cell-type hepg2
+
+    # In-place modification (Modifies input file directly):
+    python standardize_cell_type_obs.py --h5ad /path/to/sample.h5ad --cell-type hepg2 --inplace --overwrite
+
+    # Dataset name lookup in standardized directory:
     python standardize_cell_type_obs.py --dataset orion_hct116 --cell-type hct116
-    python standardize_cell_type_obs.py --dataset orion_hek293t --cell-type hek293t
-    python standardize_cell_type_obs.py --dataset nadig_hepg2 --cell-type hepg2
-    python standardize_cell_type_obs.py --dataset kolf_strong --cell-type kolf2.1j --overwrite
 
-    # Rename existing 'celltype' column in kolf_strong to 'cell_type':
-    python standardize_cell_type_obs.py --dataset kolf_strong --rename-only
-
-    # Batch apply using preset dictionary:
+    # Batch apply to standardized directory:
     python standardize_cell_type_obs.py --all
     python standardize_cell_type_obs.py --all --dry-run
 """
 
+import os
+os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
+
 import argparse
 import glob
 import logging
-import os
 import shutil
 
 import h5py
@@ -67,20 +72,45 @@ DEFAULT_CELL_TYPES = {
 
 
 def get_n_cells(h5f: h5py.File) -> int:
-    """Determine n_cells from obs group."""
-    obs = h5f["obs"]
-    if "_index" in obs:
-        return len(obs["_index"])
-    for k in obs.keys():
-        ds = obs[k]
-        if isinstance(ds, h5py.Group) and "codes" in ds:
-            return len(ds["codes"])
-        elif hasattr(ds, "shape") and len(ds.shape) > 0:
-            return ds.shape[0]
-    # Fallback to X shape
+    """Determine n_cells accurately from X or obs group."""
+    # 1. Prefer X shape if available
     if "X" in h5f:
-        if "shape" in h5f["X"].attrs:
-            return int(h5f["X"].attrs["shape"][0])
+        X = h5f["X"]
+        if isinstance(X, h5py.Group):
+            if "shape" in X.attrs:
+                return int(X.attrs["shape"][0])
+            if "indptr" in X:
+                return len(X["indptr"]) - 1
+        elif hasattr(X, "shape") and len(X.shape) > 0:
+            return int(X.shape[0])
+
+    # 2. Check obs index
+    obs = h5f.get("obs")
+    if obs is not None:
+        idx_key = obs.attrs.get("_index", "_index")
+        if idx_key in obs:
+            idx_item = obs[idx_key]
+            if isinstance(idx_item, h5py.Group):
+                if "codes" in idx_item:
+                    return len(idx_item["codes"])
+                if "values" in idx_item:
+                    return len(idx_item["values"])
+            elif hasattr(idx_item, "shape") and len(idx_item.shape) > 0:
+                return int(idx_item.shape[0])
+
+        # 3. Check any obs column
+        for k in obs.keys():
+            if k in ("__categories", "cell_type"):
+                continue
+            item = obs[k]
+            if isinstance(item, h5py.Group):
+                if "codes" in item:
+                    return len(item["codes"])
+                if "values" in item:
+                    return len(item["values"])
+            elif hasattr(item, "shape") and len(item.shape) > 0:
+                return int(item.shape[0])
+
     raise ValueError("Unable to determine n_cells.")
 
 
@@ -97,20 +127,27 @@ def update_column_order(obs_grp: h5py.Group, col_name: str, old_col: str = None)
     obs_grp.attrs["column-order"] = col_order
 
 
-def process_h5ad(h5ad_path: str, ds_name: str, cell_type_val: str = None,
+def process_h5ad(input_path: str, output_path: str, ds_name: str,
+                 cell_type_val: str = None,
                  rename_only: bool = False, overwrite: bool = False,
                  dry_run: bool = False) -> dict:
-    log.info(f"\n[{ds_name}] Inspecting: {h5ad_path}")
+    log.info(f"\n[{ds_name}] Inspecting: {input_path}")
+    if input_path != output_path:
+        log.info(f"  Target output: {output_path}")
 
-    if not os.path.exists(h5ad_path):
-        log.warning(f"  [{ds_name}] File does not exist: {h5ad_path}")
+    if not os.path.exists(input_path):
+        log.warning(f"  [{ds_name}] Input file does not exist: {input_path}")
         return {"dataset": ds_name, "status": "missing"}
 
-    if os.path.exists(h5ad_path + ".perttmp"):
+    if os.path.exists(output_path) and input_path != output_path and not overwrite:
+        log.info(f"  [{ds_name}] Output file already exists: {output_path}. Use --overwrite to replace.")
+        return {"dataset": ds_name, "status": "skipped", "reason": "output file exists"}
+
+    if os.path.exists(output_path + ".perttmp"):
         log.warning(f"  [{ds_name}] Another active job (.perttmp) detected. Skipping.")
         return {"dataset": ds_name, "status": "skipped", "reason": ".perttmp exists"}
 
-    with h5py.File(h5ad_path, "r") as h5f:
+    with h5py.File(input_path, "r") as h5f:
         obs = h5f["obs"]
         obs_keys = list(obs.keys())
         n_cells = get_n_cells(h5f)
@@ -141,8 +178,8 @@ def process_h5ad(h5ad_path: str, ds_name: str, cell_type_val: str = None,
         action = None
         target_value_desc = ""
 
-        if has_cell_type and not overwrite:
-            log.info(f"  [{ds_name}] Column '{TARGET_COL}' already exists. Use --overwrite to modify.")
+        if has_cell_type and input_path == output_path and not overwrite:
+            log.info(f"  [{ds_name}] Column '{TARGET_COL}' already exists in input file. Use --overwrite to modify.")
             return {"dataset": ds_name, "status": "skipped", "reason": "already has cell_type"}
 
         if rename_only:
@@ -167,9 +204,14 @@ def process_h5ad(h5ad_path: str, ds_name: str, cell_type_val: str = None,
         log.info(f"  [DRY-RUN] File modification skipped.")
         return {"dataset": ds_name, "status": "dry_run", "action": action, "value": target_value_desc}
 
-    # Update obs using h5py
-    tmp_path = h5ad_path + ".ct_tmp"
-    shutil.copyfile(h5ad_path, tmp_path)
+    # Ensure output directory exists
+    out_dir = os.path.dirname(output_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    # Copy input to temporary output file
+    tmp_path = output_path + ".ct_tmp"
+    shutil.copyfile(input_path, tmp_path)
 
     try:
         with h5py.File(tmp_path, "a") as h5f:
@@ -214,8 +256,8 @@ def process_h5ad(h5ad_path: str, ds_name: str, cell_type_val: str = None,
 
                 update_column_order(obs, TARGET_COL, old_col="celltype")
 
-        shutil.move(tmp_path, h5ad_path)
-        log.info(f"  [{ds_name}] Saved successfully -> {h5ad_path}")
+        shutil.move(tmp_path, output_path)
+        log.info(f"  [{ds_name}] Saved successfully -> {output_path}")
 
     except Exception as e:
         if os.path.exists(tmp_path):
@@ -227,27 +269,54 @@ def process_h5ad(h5ad_path: str, ds_name: str, cell_type_val: str = None,
 
 def parse_args():
     p = argparse.ArgumentParser(description="Standardize and inject cell_type in AnnData obs")
-    p.add_argument("--dataset", default=None, help="Target dataset name (e.g., orion_hct116, nadig_hepg2)")
+    p.add_argument("--h5ad", default=None, help="Direct path to an input h5ad file")
+    p.add_argument("--output-file", default=None, help="Explicit destination file path (leaves original input untouched)")
+    p.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="Standardized output directory path (default: /mnt/nas2/projects/vcc-data/standardized)")
+    p.add_argument("--inplace", action="store_true", help="Modify the input file directly in-place")
+    p.add_argument("--dataset", default=None, help="Target dataset name (e.g., orion_hct116, nadig_hepg2) or path")
     p.add_argument("--cell-type", default=None, help="cell_type value to inject (e.g., hct116, hepg2)")
     p.add_argument("--rename-only", action="store_true", help="Only copy/rename existing 'celltype' to 'cell_type'")
-    p.add_argument("--overwrite", action="store_true", help="Overwrite existing 'cell_type' column")
-    p.add_argument("--all", action="store_true", help="Batch process all datasets using default preset dictionary")
+    p.add_argument("--overwrite", action="store_true", help="Overwrite existing output file or existing column")
+    p.add_argument("--all", action="store_true", help="Batch process all datasets in output-dir using presets")
     p.add_argument("--dry-run", action="store_true", help="Preview changes without modifying files")
-    p.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="Standardized h5ad directory path")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
 
-    if not args.all and not args.dataset:
-        log.error("Error: Specify either --dataset [name] or --all. (See --help)")
+    if not args.all and not args.dataset and not args.h5ad:
+        log.error("Error: Specify --h5ad [path], --dataset [name], or --all. (See --help)")
         return
 
     results = []
 
-    if args.all:
-        log.info("Batch processing all datasets using default presets (--all)")
+    # Case 1: Direct h5ad path via --h5ad or --dataset pointing to an existing file
+    target_h5ad = args.h5ad
+    if not target_h5ad and args.dataset and os.path.exists(args.dataset):
+        target_h5ad = args.dataset
+
+    if target_h5ad:
+        if not os.path.exists(target_h5ad):
+            log.error(f"Error: File not found: {target_h5ad}")
+            return
+        ds_name = args.dataset if (args.dataset and not os.path.exists(args.dataset)) else os.path.splitext(os.path.basename(target_h5ad))[0]
+
+        if args.output_file:
+            out_path = args.output_file
+        elif args.inplace:
+            out_path = target_h5ad
+        else:
+            clean_name = ds_name.replace("_standardized", "")
+            out_path = os.path.join(args.output_dir, f"{clean_name}_standardized.h5ad")
+
+        r = process_h5ad(target_h5ad, out_path, ds_name, cell_type_val=args.cell_type,
+                         rename_only=args.rename_only, overwrite=args.overwrite,
+                         dry_run=args.dry_run)
+        results.append(r)
+
+    elif args.all:
+        log.info("Batch processing all datasets in output-dir using default presets (--all)")
         files = sorted(glob.glob(os.path.join(args.output_dir, "*_standardized.h5ad")))
         for f in files:
             ds_name = os.path.basename(f).replace("_standardized.h5ad", "")
@@ -255,22 +324,26 @@ def main():
 
             if preset_val is None:
                 if ds_name == "kolf_strong":
-                    r = process_h5ad(f, ds_name, cell_type_val=None, rename_only=True,
+                    r = process_h5ad(f, f, ds_name, cell_type_val=None, rename_only=True,
                                      overwrite=args.overwrite, dry_run=args.dry_run)
                 else:
                     log.info(f"[{ds_name}] No preset or skipped")
                     r = {"dataset": ds_name, "status": "skipped", "reason": "no preset"}
             else:
-                r = process_h5ad(f, ds_name, cell_type_val=preset_val, rename_only=False,
+                r = process_h5ad(f, f, ds_name, cell_type_val=preset_val, rename_only=False,
                                  overwrite=args.overwrite, dry_run=args.dry_run)
             results.append(r)
     else:
         clean_name = args.dataset.replace("_standardized.h5ad", "").replace(".h5ad", "")
         h5ad_path = os.path.join(args.output_dir, f"{clean_name}_standardized.h5ad")
-        if not os.path.exists(h5ad_path) and os.path.exists(args.dataset):
-            h5ad_path = args.dataset
+        if not os.path.exists(h5ad_path):
+            alt_path = os.path.join(args.output_dir, f"{clean_name}.h5ad")
+            if os.path.exists(alt_path):
+                h5ad_path = alt_path
 
-        r = process_h5ad(h5ad_path, clean_name, cell_type_val=args.cell_type,
+        out_path = args.output_file if args.output_file else h5ad_path
+
+        r = process_h5ad(h5ad_path, out_path, clean_name, cell_type_val=args.cell_type,
                          rename_only=args.rename_only, overwrite=args.overwrite,
                          dry_run=args.dry_run)
         results.append(r)

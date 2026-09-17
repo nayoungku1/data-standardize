@@ -16,9 +16,12 @@ Usage:
     python process_h5ad.py --chunk-size 5000
 """
 
-import argparse
-import json
 import os
+os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
+
+import argparse
+import gzip
+import json
 import gc
 import time
 import logging
@@ -381,15 +384,16 @@ def build_new_var(src_var: pd.DataFrame, src_genes: list, conversion: dict, over
 # ============================================================
 
 def process_dataset(name: str, meta_entry: dict, std_genes: list, output_dir: str,
-                    chunk_size: int = 2000, overwrite: bool = False) -> dict:
+                    chunk_size: int = 2000, overwrite: bool = False,
+                    input_h5ad: str = None) -> dict:
     """
     Standardizes a single dataset by filtering to keep only overlapping standard genes.
     Shape: n_cells × n_overlap (No zero-padding)
     """
-    h5ad_path   = meta_entry["h5ad_path"]
+    h5ad_path   = input_h5ad or meta_entry["h5ad_path"]
     output_path = os.path.join(output_dir, f"{name}_standardized.h5ad")
 
-    if not overwrite and os.path.exists(output_path):
+    if h5ad_path != output_path and not overwrite and os.path.exists(output_path):
         log.info(f"[{name}] Already exists, skipping: {output_path}")
         return {"name": name, "status": "skipped", "output": output_path}
 
@@ -397,11 +401,8 @@ def process_dataset(name: str, meta_entry: dict, std_genes: list, output_dir: st
     log.info(f"[{name}] Starting: {h5ad_path}")
     t0 = time.time()
 
-    src_genes  = meta_entry["gene"]
+    src_genes  = meta_entry.get("gene")
     conversion = build_conversion_dict(meta_entry)
-    src_col_indices, dest_col_indices, overlap_genes = compute_index_mapping(src_genes, conversion, std_genes)
-    n_overlap  = len(overlap_genes)
-    log.info(f"[{name}] Filtered {n_overlap:,} overlapping standard genes out of {len(src_genes):,} original genes (no zero-padding)")
 
     # Load obs/var/uns/obsm
     al = ad.read_h5ad(h5ad_path, backed="r")
@@ -410,9 +411,17 @@ def process_dataset(name: str, meta_entry: dict, std_genes: list, output_dir: st
     uns      = dict(al.uns)
     obsm     = {k: al.obsm[k] for k in al.obsm.keys()}
     layer_keys = list(al.layers.keys())
+
+    if src_genes is None or len(src_genes) != len(src_var):
+        src_genes = al.var_names.tolist()
+
     al.file.close()
     del al
     gc.collect()
+
+    src_col_indices, dest_col_indices, overlap_genes = compute_index_mapping(src_genes, conversion, std_genes)
+    n_overlap  = len(overlap_genes)
+    log.info(f"[{name}] Filtered {n_overlap:,} overlapping standard genes out of {len(src_genes):,} original genes (no zero-padding)")
 
     # Sanitize obs index and column dtypes (ensures StringArray compatibility for mixscale etc.)
     obs.index = obs.index.astype(str)
@@ -424,39 +433,48 @@ def process_dataset(name: str, meta_entry: dict, std_genes: list, output_dir: st
     log.info(f"[{name}] {n_cells:,} cells, layers: {layer_keys}")
 
     os.makedirs(output_dir, exist_ok=True)
-    tmp_path = output_path + ".tmp"
+    tmp_path = output_path + ".gene_std.tmp"
     new_var  = build_new_var(src_var, src_genes, conversion, overlap_genes)
 
-    # Write skeletal AnnData structure first
-    ad.AnnData(obs=obs, var=new_var, uns=uns, obsm=obsm).write_h5ad(tmp_path)
-    gc.collect()
+    try:
+        # Write skeletal AnnData structure first
+        ad.AnnData(obs=obs, var=new_var, uns=uns, obsm=obsm).write_h5ad(tmp_path)
+        gc.collect()
 
-    # Incrementally write X + layers via h5py (Shape: n_cells × n_overlap)
-    with h5py.File(h5ad_path, "r") as h5src, h5py.File(tmp_path, "a") as h5dst:
+        # Incrementally write X + layers via h5py (Shape: n_cells × n_overlap)
+        with h5py.File(h5ad_path, "r") as h5src, h5py.File(tmp_path, "a") as h5dst:
 
-        # X
-        if "X" in h5dst:
-            del h5dst["X"]
-        x_grp   = h5dst.create_group("X")
-        x_writer = IncrementalCSRWriter(x_grp, n_cols=n_overlap, expected_cells=n_cells)
-        process_X_to_h5(h5src, n_cells, src_col_indices, dest_col_indices,
-                         n_overlap, chunk_size, x_writer, n_src_genes=len(src_genes))
-        x_writer.finalize()
+            # X
+            if "X" in h5dst:
+                del h5dst["X"]
+            x_grp   = h5dst.create_group("X")
+            x_writer = IncrementalCSRWriter(x_grp, n_cols=n_overlap, expected_cells=n_cells)
+            process_X_to_h5(h5src, n_cells, src_col_indices, dest_col_indices,
+                             n_overlap, chunk_size, x_writer, n_src_genes=len(src_genes))
+            x_writer.finalize()
 
-        # layers
-        if layer_keys:
-            if "layers" not in h5dst:
-                h5dst.create_group("layers")
-            lgrp = h5dst["layers"]
-            for lk in layer_keys:
-                if lk in lgrp:
-                    del lgrp[lk]
-                lw = IncrementalCSRWriter(lgrp.create_group(lk), n_cols=n_overlap, expected_cells=n_cells)
-                process_layer_to_h5(h5src, lk, n_cells, src_col_indices, dest_col_indices,
-                                     n_overlap, chunk_size, lw, n_src_genes=len(src_genes))
-                lw.finalize()
+            # layers
+            if layer_keys:
+                if "layers" not in h5dst:
+                    h5dst.create_group("layers")
+                lgrp = h5dst["layers"]
+                for lk in layer_keys:
+                    if lk in lgrp:
+                        del lgrp[lk]
+                    lw = IncrementalCSRWriter(lgrp.create_group(lk), n_cols=n_overlap, expected_cells=n_cells)
+                    process_layer_to_h5(h5src, lk, n_cells, src_col_indices, dest_col_indices,
+                                         n_overlap, chunk_size, lw, n_src_genes=len(src_genes))
+                    lw.finalize()
 
-    shutil.move(tmp_path, output_path)
+        shutil.move(tmp_path, output_path)
+    except Exception as e:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        raise e
+
     elapsed = time.time() - t0
     log.info(f"[{name}] Finished: {output_path} ({n_cells:,}×{n_overlap:,}, {elapsed:.1f}s)")
 
@@ -468,36 +486,62 @@ def process_dataset(name: str, meta_entry: dict, std_genes: list, output_dir: st
 # 9. Update JSON gene_conversion
 # ============================================================
 
-def update_json_with_conversions(json_path: str, gtf_gz_path: str):
+def load_gencode_v32(gtf_gz: str) -> tuple:
+    """Returns Ensembl ID -> gene symbol mapping and v32 gene symbol set."""
+    log.info(f"Loading GENCODE v32 GTF: {gtf_gz}")
+    ens2sym = {}
+    v32_set = set()
+    with gzip.open(gtf_gz, "rt", encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("#"):
+                continue
+            fields = line.strip().split("\t")
+            if len(fields) < 9 or fields[2] != "gene":
+                continue
+            attrs = fields[8]
+            gene_name = gene_id = None
+            for item in attrs.split(";"):
+                item = item.strip()
+                if item.startswith("gene_name"):
+                    gene_name = item.split('"')[1] if '"' in item else item.split(" ", 1)[1]
+                elif item.startswith("gene_id"):
+                    gene_id = item.split('"')[1] if '"' in item else item.split(" ", 1)[1]
+            if gene_name:
+                v32_set.add(gene_name)
+            if gene_id and gene_name:
+                ens2sym[gene_id] = gene_name
+                ens2sym[gene_id.split(".")[0]] = gene_name
+    log.info(f"  GENCODE v32: {len(v32_set):,} symbols, {len(ens2sym):,} Ensembl IDs")
+    return ens2sym, v32_set
+
+
+def update_json_with_conversions(json_path: str, gtf_gz_path: str, target_names: list = None):
     """Add gene_conversion field to each dataset entry in metadata JSON."""
     log.info("Computing gene_conversion mappings...")
-    from gtfparse import read_gtf
     import mygene
 
-    log.info("Loading GTF...")
-    gtf_df   = read_gtf(gtf_gz_path).to_pandas()
-    genes_df = gtf_df[gtf_df["feature"] == "gene"].copy()
-    genes_df["ensembl_base"] = genes_df["gene_id"].str.split(".").str[0]
-    ens2v32  = dict(zip(genes_df["ensembl_base"], genes_df["gene_name"]))
-    v32_set  = set(genes_df["gene_name"])
-    log.info(f"GTF loaded: {len(v32_set):,} symbols")
+    ens2v32, v32_set = load_gencode_v32(gtf_gz_path)
 
     with open(json_path) as f:
         meta = json.load(f)
 
     mg = mygene.MyGeneInfo()
     for name, entry in meta.items():
+        if target_names is not None and name not in target_names:
+            continue
         if "gene_conversion" in entry:
             log.info(f"[{name}] gene_conversion already exists")
             continue
-        gene_list  = entry["gene"]
+        gene_list  = entry.get("gene", [])
         mismatched = [g for g in gene_list if g not in v32_set]
         conv       = {g: g for g in gene_list}
         log.info(f"[{name}] Querying mygene for {len(mismatched):,} mismatched symbols...")
         if mismatched:
             for res in mg.querymany(mismatched, scopes="symbol,alias",
                                     fields="ensembl.gene", species="human", verbose=False):
-                q = res["query"]
+                q = res.get("query")
+                if not q:
+                    continue
                 if "ensembl" in res:
                     ed   = res["ensembl"]
                     eids = [e.get("gene") for e in ed] if isinstance(ed, list) else [ed.get("gene")]
@@ -530,6 +574,10 @@ def parse_args():
                    help="Path to metadata JSON")
     p.add_argument("--gene-csv",   default="/mnt/nas2/projects/vcc-data/vcc-2026/gene_names.csv",
                    help="Path to standard gene list CSV")
+    p.add_argument("--input-dir",  default=None,
+                   help="Directory containing input h5ad files (e.g. standardized). If found, used instead of meta['h5ad_path']")
+    p.add_argument("--input-h5ad", default=None,
+                   help="Explicit path to single input h5ad file")
     p.add_argument("--output-dir", default="/mnt/nas2/projects/vcc-data/standardized",
                    help="Directory to save standardized h5ad files")
     p.add_argument("--gtf-gz",
@@ -554,32 +602,40 @@ def main():
 
     std_genes = load_standard_genes(args.gene_csv)
 
+    targets = {args.dataset: meta[args.dataset]} if args.dataset else meta
+
     if args.update_json_only:
-        needs = [n for n, e in meta.items() if "gene_conversion" not in e]
+        needs = [n for n, e in targets.items() if "gene_conversion" not in e]
         if needs:
             log.info(f"Uncomputed gene_conversion: {needs}")
-            update_json_with_conversions(args.meta_json, args.gtf_gz)
+            update_json_with_conversions(args.meta_json, args.gtf_gz, target_names=list(targets.keys()))
+        else:
+            log.info("All target datasets already have gene_conversion")
         log.info("--update-json-only completed")
         return
 
-    if args.dataset is None:
-        needs = [n for n, e in meta.items() if "gene_conversion" not in e]
-        if needs:
-            log.info(f"Uncomputed gene_conversion ({len(needs)} datasets): {needs}")
-            log.info("Computing automatically using GTF + mygene API...")
-            update_json_with_conversions(args.meta_json, args.gtf_gz)
-            with open(args.meta_json) as f:
-                meta = json.load(f)
-
-    targets = {args.dataset: meta[args.dataset]} if args.dataset else meta
+    needs = [n for n, e in targets.items() if "gene_conversion" not in e]
+    if needs:
+        log.info(f"Uncomputed gene_conversion ({len(needs)} datasets): {needs}")
+        log.info("Computing automatically using GTF + mygene API...")
+        update_json_with_conversions(args.meta_json, args.gtf_gz, target_names=list(targets.keys()))
+        with open(args.meta_json) as f:
+            meta = json.load(f)
+        targets = {args.dataset: meta[args.dataset]} if args.dataset else meta
 
     results = []
     for name, entry in targets.items():
         try:
+            in_file = args.input_h5ad
+            if in_file is None and args.input_dir is not None:
+                cand = os.path.join(args.input_dir, f"{name}_standardized.h5ad")
+                if os.path.exists(cand):
+                    in_file = cand
             r = process_dataset(name, entry, std_genes,
                                 output_dir=args.output_dir,
                                 chunk_size=args.chunk_size,
-                                overwrite=args.overwrite)
+                                overwrite=args.overwrite,
+                                input_h5ad=in_file)
             results.append(r)
         except Exception as e:
             log.error(f"[{name}] ERROR: {e}", exc_info=True)
