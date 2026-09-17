@@ -161,3 +161,38 @@ nohup uv run python -u process_h5ad.py \
   python update_target_gene_symbols.py
   ```
 
+---
+
+### 8) `compute_perturbation_effects.py`
+- **Purpose**: Computes perturbation-specific effect metrics (**logFC** and **delta**) for both normalized (Option A) and raw (Option B) counts relative to non-targeting controls (`target_gene == 'non-targeting'`) and stores them directly into `adata.uns` across standardized datasets (excluding `mixscale_*`).
+  - **Metrics Computed**:
+    - **Normalized (Option A)**:
+      - Cell library-size normalized to 10,000 counts (CP10k) and transformed via $\ln(1 + x)$.
+      - `delta_norm`: $\overline{\log1p(X_p)} - \overline{\log1p(X_{\text{ctrl}})}$
+      - `logfc_norm`: $\log_2(e) \times \text{delta\_norm}$
+    - **Raw Counts (Option B)**:
+      - Computed directly on raw integer expression matrix $X$:
+      - `delta_raw`: $\overline{X_p} - \overline{X_{\text{ctrl}}}$
+      - `logfc_raw`: $\log_2\left(\frac{\overline{X_p} + \epsilon}{\overline{X_{\text{ctrl}}} + \epsilon}\right)$ (default $\epsilon = 0.1$)
+    - **Standard Aliases**:
+      - `logfc` $\rightarrow$ `logfc_norm`
+      - `delta` $\rightarrow$ `delta_norm`
+  - **Storage**:
+    - Stored as 2D float32 matrices in `adata.uns['logfc_norm']`, `adata.uns['delta_norm']`, `adata.uns['logfc_raw']`, `adata.uns['delta_raw']` (shape: $n_{\text{perts}} \times n_{\text{genes}}$), with matching perturbation names in `adata.uns['perturbations']`.
+    - Easily queried as a DataFrame via helper function `get_perturbation_effect(adata, 'logfc_norm')`.
+    - Written in-place via `h5py` within seconds without rewriting $X$.
+  - **Target Datasets (10 datasets, strictly excluding `mixscale_*`)**:
+    - `kaggle`, `nadig_hepg2`, `nadig_jurkat`, `replogle_rpe1`, `replogle_k562_essential`, `replogle_k562_gwp`, `orion_hct116`, `orion_hek293t`, `arc_h1`, `kolf_strong`.
+- **Usage**:
+  ```bash
+  # Preview calculations on a single dataset without modifying file
+  python compute_perturbation_effects.py --dataset kaggle --dry-run
+
+  # Apply in-place to a specific dataset
+  python compute_perturbation_effects.py --dataset kaggle
+
+  # Batch process all 10 non-mixscale datasets in the background
+  nohup python -u compute_perturbation_effects.py --all > compute_effects.log 2>&1 &
+  ```
+
+
