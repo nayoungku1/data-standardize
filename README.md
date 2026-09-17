@@ -170,9 +170,9 @@ nohup uv run python -u process_h5ad.py \
       - Cell library-size normalized to 10,000 counts (CP10k) and transformed via $\ln(1 + x)$ (natural log):
         $$X^{\text{norm}} = \ln\left(1 + \frac{X}{\sum X} \times 10{,}000\right)$$
       - `delta_norm`: Difference in mean log-normalized expression:
-        $$\text{delta\_norm} = \overline{X_p^{\text{norm}}} - \overline{X_{\text{ctrl}}^{\text{norm}}}$$
+        $$\text{delta\\\_norm} = \overline{X_p^{\text{norm}}} - \overline{X_{\text{ctrl}}^{\text{norm}}}$$
       - `logfc_norm`: $\log_2$ fold-change converted from natural log difference (Scanpy standard):
-        $$\text{logfc\_norm} = \log_2(e) \times \text{delta\_norm} = \frac{\text{delta\_norm}}{\ln(2)}$$
+        $$\text{logfc\\_norm} = \log_2(e) \times \text{delta\\_norm} = \frac{\text{delta\\_norm}}{\ln(2)}$$
     - **Raw Counts (Option B)**:
       - Computed directly on raw integer expression matrix $X$:
       - `delta_raw`: $\overline{X_p} - \overline{X_{\text{ctrl}}}$
